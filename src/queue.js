@@ -1,18 +1,10 @@
-var low = require('lowdb')
 var uuid = require('uuid')
 var debug = require('debug')('pdf:db')
 var error = require('./error')
 var webhook = require('./webhook')
 var utils = require('./utils')
 
-function createQueue (path, options = {}, initialValue = []) {
-  var db = low(path, options)
-
-  db.defaults({
-      queue: initialValue
-    })
-    .write()
-
+function createQueue (db, options = {}) {
   var createQueueMethod = function (func) {
     return function() {
       var args = Array.prototype.slice.call(arguments, 0)
@@ -23,12 +15,16 @@ function createQueue (path, options = {}, initialValue = []) {
   return {
     addToQueue: createQueueMethod(addToQueue),
     attemptPing: createQueueMethod(attemptPing),
+    close: createQueueMethod(close),
     getById: createQueueMethod(getById),
     getList: createQueueMethod(getList),
     getNext: createQueueMethod(getNext),
+    getAllUnfinished: createQueueMethod(getAllUnfinished),
     getNextWithoutSuccessfulPing: createQueueMethod(getNextWithoutSuccessfulPing),
+    isBusy: createQueueMethod(isBusy),
     processJob: createQueueMethod(processJob),
-    purge: createQueueMethod(purge)
+    purge: createQueueMethod(purge),
+    setIsBusy: createQueueMethod(setIsBusy)
   }
 }
 
@@ -59,12 +55,11 @@ function addToQueue (db, data) {
 
   debug('Pushing job to queue with data %s', JSON.stringify(data))
 
-  db
-    .get('queue')
-    .push(data)
-    .write()
+  return db.pushToQueue(data)
+}
 
-  return data
+function close(db) {
+  return db.close()
 }
 
 // =========
@@ -72,127 +67,37 @@ function addToQueue (db, data) {
 // =========
 
 function getList (db, failed = false, completed = false, limit) {
-  var query = db.get('queue')
-
-  query = query.filter(function (job) {
-    // failed jobs
-    if (!failed && job.completed_at === null && job.generations.length > 0) {
-      return false
-    }
-
-    // completed jobs
-    if (!completed && job.completed_at !== null) {
-      return false
-    }
-
-    return true
-  })
-
-  if (limit) {
-    query = query.take(limit)
-  }
-
-  return query.value()
+  return db.getList(failed, completed, limit)
 }
 
 function getById (db, id) {
-  return db
-    .get('queue')
-    .find({ id: id })
-    .value()
+  return db.getById(id)
 }
 
 function getNext (db, shouldWait, maxTries = 5) {
-  return db
-    .get('queue')
-    .filter(function (job) {
-      if (job.completed_at !== null) {
-        return false
-      }
+  return getAllUnfinished(db, shouldWait, maxTries).then(function (jobs) {
+    return jobs.length > 0 ? jobs[0] : null;
+  })
+}
 
-      var currentTries = job.generations.length
-
-      if (currentTries === 0) {
-        return true
-      }
-
-      if (currentTries < maxTries) {
-        var lastRun = job.generations[currentTries - 1].generated_at
-
-        if (_hasWaitedLongEnough(lastRun, shouldWait(job, currentTries))) {
-          return true
-        }
-      }
-
-      return false
-    })
-    .take(1)
-    .value()[0]
+function getAllUnfinished (db, shouldWait, maxTries = 5) {
+  return db.getAllUnfinished (shouldWait, maxTries)
 }
 
 function getNextWithoutSuccessfulPing (db, shouldWait, maxTries = 5) {
-  return db
-    .get('queue')
-    .filter(function (job) {
-      var currentTries = job.pings.length
+  return db.getNextWithoutSuccessfulPing(shouldWait, maxTries)
+}
 
-      if (job.completed_at === null) {
-        return false
-      }
-
-      if (currentTries === 0) {
-        return true
-      }
-
-      if (currentTries >= maxTries) {
-        return false
-      }
-
-      var unsuccessfulPings = job.pings.filter(ping => ping.error)
-
-      // There are some successful ping(s)
-      if (unsuccessfulPings.length !== job.pings.length) {
-        return false
-      }
-
-      var lastTry = unsuccessfulPings[unsuccessfulPings.length - 1].sent_at
-      if (_hasWaitedLongEnough(lastTry, shouldWait(job, currentTries))) {
-        return true
-      }
-
-      return false
-    })
-    .take(1)
-    .value()[0]
+function isBusy (db) {
+  return db.isBusy()
 }
 
 function purge (db, failed = false, pristine = false, maxTries = 5) {
-  var query = db.get('queue').slice(0)
+  return db.purge(failed, pristine, maxTries)
+}
 
-  query = query.filter(function (job) {
-    // failed jobs
-    if (failed && job.completed_at === null && job.generations.length >= maxTries) {
-      return true
-    }
-
-    // new jobs
-    if (pristine && job.completed_at === null && job.generations.length < maxTries) {
-      return true
-    }
-
-    // completed jobs
-    if (job.completed_at !== null) {
-      return true
-    }
-
-    return false
-  })
-
-  var queue = query.value()
-
-  for(var i in queue) {
-    db.get('queue').remove({ id: queue[i].id }).write()
-  }
+function setIsBusy(db, isBusy) {
+  return db.setIsBusy(isBusy)
 }
 
 // ==========
@@ -201,25 +106,33 @@ function purge (db, failed = false, pristine = false, maxTries = 5) {
 
 function processJob (db, generator, job, webhookOptions) {
   return generator(job.url, job)
-    .then(response => {
-      _logGeneration(db, job.id, response)
+    .then(function (response) {
+      return _logGeneration(db, job.id, response)
+        .then(function (logResponse) {
+          if (!error.isError(response)) {
+            debug('Job %s was processed, marking job as complete.', job.id)
 
-      if (!error.isError(response)) {
-        debug('Job %s was processed, marking job as complete.', job.id)
+            return Promise.all([
+              _markAsCompleted(db, job.id),
+              _setStorage(db, job.id, response.storage)
+            ]).then(function () {
+              if (!webhookOptions) {
+                return response
+              }
 
-        _markAsCompleted(db, job.id)
-        _setStorage(db, job.id, response.storage)
-
-        if (webhookOptions) {
-          // Important to return promise otherwise the npm cli process will exit early
-          return attemptPing(db, job, webhookOptions)
-            .then(function() {
-              return response
+              // Re-fetch the job as storage has been added
+              return getById(db, job.id).then(function (job) {
+                // Important to return promise otherwise the npm cli process will exit early
+                return attemptPing(db, job, webhookOptions)
+                  .then(function() {
+                    return response
+                  })
+              })
             })
-        }
-      }
+          }
 
-      return response
+          return response
+        })
     })
 }
 
@@ -234,9 +147,10 @@ function attemptPing (db, job, webhookOptions) {
 
   return webhook.ping(job, webhookOptions)
     .then(response => {
-      _logPing(db, job.id, response)
-
-      return response
+      return _logPing(db, job.id, response)
+        .then(function () {
+          return response
+        })
     })
 }
 
@@ -244,39 +158,16 @@ function attemptPing (db, job, webhookOptions) {
 // PRIVATE METHODS
 // ===============
 
-function _hasWaitedLongEnough (logTimestamp, timeToWait) {
-  var diff = (new Date() - new Date(logTimestamp))
-  return diff > timeToWait
-}
-
 function _logGeneration (db, id, response) {
   debug('Logging try for job ID %s', id)
 
-  var job = getById(db, id)
-
-  var generations = job.generations.slice(0)
-  generations.push(response)
-
-  return db
-    .get('queue')
-    .find({ id: id })
-    .assign({ generations: generations })
-    .write()
+  return db.logGeneration(id, response)
 }
 
 function _logPing (db, id, response) {
   debug('Logging ping for job ID %s', id)
 
-  var job = getById(db, id)
-
-  var pings = job.pings.slice(0)
-  pings.push(response)
-
-  return db
-    .get('queue')
-    .find({ id: id })
-    .assign({ pings: pings })
-    .write()
+  return db.logPing(id, response)
 }
 
 function _markAsCompleted (db, id) {
@@ -284,19 +175,11 @@ function _markAsCompleted (db, id) {
 
   debug('Marking job ID %s as completed at %s', id, completed_at)
 
-  return db
-    .get('queue')
-    .find({ id: id })
-    .assign({ completed_at: completed_at })
-    .write()
+  return db.markAsCompleted(id)
 }
 
 function _setStorage (db, id, storage) {
-  return db
-    .get('queue')
-    .find({ id: id })
-    .assign({ storage: storage })
-    .write()
+  return db.setStorage(id, storage)
 }
 
 module.exports = createQueue
